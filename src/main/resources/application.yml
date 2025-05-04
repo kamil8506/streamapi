@@ -1,0 +1,44 @@
+spring:
+  application:
+    name: stream-api
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/exchange_betfair_mongo_feed_db_dev
+      database: exchange_betfair_mongo_feed_db_dev
+  redis:
+    host: localhost
+    port: 6379
+
+betfair:
+  type: pkcs12
+  app-key: SdfdfRjtyk66
+  username: JetF2wretfh
+  password: G@eghet1234
+  cert-path: C:\Users\User\Documents\Sijo-latest-code\stream-api\src\main\resources\certificate\betFair.p12
+  #cert-path: /app/betFair.p12
+  cert-password: betdsaQ23
+  login-url: https://identitysso-cert.betfair.com/api/certlogin
+  logout-url: https://identitysso.betfair.com/api/logout
+  keepAlive-url: https://identitysso.betfair.com/api/keepAlive
+  keepAlive-interval: 39600000
+
+stream:
+  host: stream-api.betfair.com
+  timeout: 30000
+  port: 443
+  keepAlive: 3600000
+  isMarketRemovedOnClose: true
+  autoReconnect: true
+  reconnectBackOff: 15000
+  conflateMs: 60000
+  heartbeatMs: 1000
+
+logging:
+  file:
+    name: logs/feeder-service.log
+  level:
+    root: INFO
+
+scheduled:
+  initialDelay: 1800000  # 30 minutes in milliseconds
+  fixedRate: 900000      # 15 minutes in milliseconds
