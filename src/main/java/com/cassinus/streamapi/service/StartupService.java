@@ -17,6 +17,7 @@ import com.cassinus.streamapi.model.*;
 import com.cassinus.streamapi.protocol.FutureResponse;
 import com.cassinus.streamapi.protocol.RequestResponseProcessor;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -57,6 +58,8 @@ public class StartupService {
     private boolean autoReconnect;
     @Value("${stream.reconnectBackOff}")
     private long reconnectBackOff;
+    @Value("${stream.isRecoveryMode}")
+    private boolean isRecoveryMode;
 
 
     private Socket client;
@@ -65,28 +68,40 @@ public class StartupService {
 
     private static final String CRLF = "\r\n";
     private final RequestResponseProcessor processor;
-    private ScheduledExecutorService keepAliveTimer;
+    //private ScheduledExecutorService keepAliveTimer;
     private int disconnectCounter;
-    private int reconnectCounter;
 
     private volatile boolean isStarted;
     private volatile boolean isStopped;
-    private long lastConnectTime;
 
     private final RedisTemplate<String, Object> redisTemplate;
     private final ObjectMapper objectMapper;
 
     private final SubscriptionRepository subscriptionRepository;
+    private final Object reconnectLock = new Object();
+    private volatile boolean reconnecting = false;
+    //private final ScheduledExecutorService reconnectExecutor = Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService conExecutor = Executors.newScheduledThreadPool(2);
+    private volatile boolean maintenanceMode = false;
+
+    private volatile Thread readerThread;
+    
+    private final DataRecoveryService dataRecoveryService;
 
     @Autowired
     public StartupService(StreamCache streamCache, RedisTemplate<String, Object> redisTemplate,
-                          ObjectMapper objectMapper, SubscriptionRepository subscriptionRepository) {
+                          ObjectMapper objectMapper, SubscriptionRepository subscriptionRepository
+                          ,DataRecoveryService dataRecoveryService) {
         this.processor = new RequestResponseProcessor(this::sendLineImpl, subscriptionRepository);
         this.processor.setChangeHandler(streamCache);
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
         this.subscriptionRepository = subscriptionRepository;
+        this.dataRecoveryService = dataRecoveryService;
     }
+
+    @Autowired
+    private AuthService authService;
 
     @EventListener(ApplicationReadyEvent.class)
     private void startUp() {
@@ -101,12 +116,11 @@ public class StartupService {
     private void startStreamingClient() throws StatusException, ConnectionException {
         disconnectCounter = 0;
         connectSocket();
-
-        Thread thread = new Thread(this::run, "ESAClient");
-        thread.start();
-
-        keepAliveTimer = Executors.newSingleThreadScheduledExecutor();
-        keepAliveTimer.scheduleAtFixedRate(() -> {
+//      To recover past market data from betfair api and update in redis & db
+        if(isRecoveryMode)
+        	dataRecoveryService.dataRecovery();
+        startReaderThread();
+        conExecutor.scheduleAtFixedRate(() -> {
             try {
                 keepAliveCheck();
             } catch (Exception e) {
@@ -116,6 +130,34 @@ public class StartupService {
 
         connectAndAuthenticate();
         isStarted = true;
+    }
+
+    private void startReaderThread() {
+        stopReaderThread();
+        readerThread = new Thread(this::run, "ESAClient");
+        readerThread.start();
+        //logger.info("Reader thread started.");
+    }
+
+//    private void stopReaderThread() {
+//        if (readerThread != null) {
+//            readerThread.interrupt();
+//            readerThread = null;
+//            //logger.info("Reader thread interrupted.");
+//        }
+//    }
+
+    private synchronized void stopReaderThread() {
+        if (readerThread != null) {
+            readerThread.interrupt(); // mark interrupted
+            try {
+                if (reader != null) reader.close(); // force unblock readLine
+                if (client != null) client.close(); // ensures underlying socket closed
+            } catch (IOException e) {
+                logger.warn("Error while closing reader/client in stopReaderThread: {}", e.getMessage());
+            }
+            readerThread = null;
+        }
     }
 
     private void connectAndAuthenticate()
@@ -132,51 +174,151 @@ public class StartupService {
         authenticate();
     }
 
-
     private void run() {
-        while (!isStopped) {
-            //String line;
-            try {
+        try {
+            while (!isStopped && !Thread.currentThread().isInterrupted()) {
                 String line;
-                while ((line = reader.readLine()) != null) {
+                while (client != null && !client.isClosed() && (line = reader.readLine()) != null) {
                     processor.receiveLine(line);
+
+                    // Interrupt flag check (optional, for extra safety)
+                    if (Thread.currentThread().isInterrupted()) {
+                        logger.info("Reader thread interrupted, exiting inner loop.");
+                        break;
+                    }
                 }
-            } catch (IOException e) {
-                logger.error("ESAClient: Error received processing socket - disconnecting:", e);
+                // If it has reached this point, either the client has closed the connection, readLine returned null, or an exception occurred
+                logger.warn("Socket read loop ended, disconnecting...");
                 disconnected();
             }
+        } catch (IOException e) {
+            logger.error("ESAClient read error:", e);
+            disconnected();
         }
+        logger.info("Reader thread exiting cleanly.");
     }
 
     private void disconnected() {
-        logger.info("disconnect count: {}", disconnectCounter++);
+        logger.warn("Disconnected. Attempt: {}", disconnectCounter++);
+        processor.disconnected();
+
         if (isStarted && autoReconnect) {
-            processor.disconnected();
             tryReconnect();
         } else {
-            processor.stopped();
             isStopped = true;
+            processor.stopped();
         }
     }
 
     private void tryReconnect() {
-        if (System.currentTimeMillis() - lastConnectTime < reconnectBackOff) {
-            try {
-                logger.info("Reconnect backoff for {}ms", reconnectBackOff);
-                Thread.sleep(reconnectBackOff);
-            } catch (InterruptedException e) {
-                logger.error("Reconnect back off interrupted", e);
+        disconnect();
+        synchronized (reconnectLock) {
+            if (reconnecting) {
+                logger.warn("Reconnect already in progress, skipping...");
+                return;
             }
+            reconnecting = true;
         }
+        conExecutor.execute(() -> {
+            int maxAttempts = 120;
+            long reconnectStart = System.currentTimeMillis();
+            long maxReconnectDuration = TimeUnit.HOURS.toMillis(1); // 1 hour max
 
+            try {
+                while (!isStopped && autoReconnect) {
+                    int attempt = 0;
+                    long backoff = reconnectBackOff;
+
+                    while (attempt < maxAttempts && !isStopped && autoReconnect) {
+                        if (Thread.currentThread().isInterrupted()) {
+                            logger.warn("Reconnect thread interrupted before attempt.");
+                            return;
+                        }
+
+                        try {
+                            attempt++;
+                            logger.info("Reconnect attempt #{}", attempt);
+
+                            processor.disconnected(); // clear pending futures
+
+                            connectSocket();
+                            dataRecoveryService.dataRecovery(); // Proceeding for data recovery only after sucessful socket connection
+                            startReaderThread();
+                            connectAndAuthenticateAndResubscribe();
+
+                            long duration = System.currentTimeMillis() - reconnectStart;
+                            logger.info("Reconnection successful on attempt #{} after {}ms", attempt, duration);
+                            onReconnectSuccess();
+                            return;
+                        } catch (Exception ex) {
+                            logger.warn("Reconnect attempt #{} failed: {}", attempt, ex.getMessage());
+                            backoff = calculateBackoffWithJitter(attempt);
+                            logger.info("Backoff for {}ms before next attempt...", backoff);
+                            try {
+                                TimeUnit.MILLISECONDS.sleep(backoff);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                logger.warn("Reconnect sleep interrupted.");
+                                return;
+                            }
+                        }
+                    }
+                    // fail-safe limit after N failures
+                    if (System.currentTimeMillis() - reconnectStart > maxReconnectDuration) {
+                        logger.error("Reconnect failed after {} attempts. Cooling down for 1 minute...", attempt);
+                        sleepQuietly(60000);
+                        attempt = 0; // reset attempts after cool down
+                        reconnectStart = System.currentTimeMillis(); // reset timer
+                    }
+                }
+
+            } finally {
+                synchronized (reconnectLock) {
+                    reconnecting = false;
+                }
+            }
+        });
+    }
+
+    private void sleepQuietly(long ms) {
         try {
-            connectSocket();
-            keepAliveTimer.schedule(
-                    this::connectAndAuthenticateAndResubscribe, 0, TimeUnit.MILLISECONDS);
-        } catch (Exception e) {
-            logger.error("Reconnect attempt={} failed: ", reconnectCounter, e);
-            reconnectCounter++;
+            TimeUnit.MILLISECONDS.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
+    }
+
+    private long calculateBackoffWithJitter(int attempt) {
+        long base = Math.min((1L << attempt) * reconnectBackOff, TimeUnit.MINUTES.toMillis(2));
+        long jitter = ThreadLocalRandom.current().nextLong(500, 1000);
+        return base + jitter;
+    }
+
+    private void onReconnectSuccess() {
+        logger.info("Reconnect successful. Metrics or alert can be triggered here.");
+    }
+
+    private void onReconnectFailure() {
+        logger.error("Reconnect permanently failed. Trigger alert or metrics.");
+    }
+
+    public void setMaintenanceMode(boolean status) {
+        this.maintenanceMode = status;
+        if (!status && !reconnecting && autoReconnect) {
+            tryReconnect(); // resume after maintenance
+        }
+    }
+
+    @PreDestroy
+    public void onDestroy() {
+        logger.info("Shutting down stream client");
+        shutdown();
+    }
+
+    public void shutdown() {
+        isStopped = true;
+        disconnect();
+        conExecutor.shutdownNow();
     }
 
     private MarketSubscriptionMessage getMarketSubscriptionMessage(List<String> listOfSportId, MarketSubscriptionMessage marketSubscriptionMessage
@@ -215,33 +357,29 @@ public class StartupService {
         waitFor(processor.marketSubscription(message));
     }
 
-    public void keepAliveCheck() {
-        try {
-            if (processor.getStatus() == ConnectionStatus.SUBSCRIBED) {
-                // connection looks up
-                if (processor.getLastRequestTime() + keepAliveHeartBeat
-                        < System.currentTimeMillis()) {
-                    // send a heartbeat to server to keep networks open
-                    logger.info(
-                            "Last Request Time is longer than {}: Sending Keep Alive Heartbate",
-                            keepAliveHeartBeat);
-                    heartbeat();
-                } else if (processor.getLastResponseTime() + timeout < System.currentTimeMillis()) {
-                    logger.info(
-                            "Last Response Time is longer than {}: Sending Keep Alive Heartbate",
-                            timeout);
-                    heartbeat();
-                }
-                logger.info("keep alive not called");
-            }
-        } catch (Exception e) {
-            logger.error("Keep alive failed", e);
-        }
+    private void heartbeat() throws ConnectionException, StatusException {
+        waitFor(processor.heartbeat(new HeartbeatMessage()));
     }
 
+    public void keepAliveCheck() {
+        if (processor.getStatus() != ConnectionStatus.SUBSCRIBED) {
+            logger.debug("Skipping keep-alive: Not in SUBSCRIBED state");
+            return;
+        }
 
-    public void heartbeat() throws ConnectionException, StatusException {
-        waitFor(processor.heartbeat(new HeartbeatMessage()));
+        long currentTime = System.currentTimeMillis();
+        boolean needHeartbeat = processor.getLastRequestTime() + keepAliveHeartBeat < currentTime
+                || processor.getLastResponseTime() + timeout < currentTime;
+
+        if (needHeartbeat) {
+            logger.info("Sending keep-alive heartbeat...");
+            try {
+                heartbeat();
+            } catch (Exception e) {
+                logger.error("KeepAlive heartbeat failed: {}", e.getMessage(), e);
+                tryReconnect();
+            }
+        }
     }
 
     private FutureResponse<StatusMessage> waitFor(FutureResponse<StatusMessage> task)
@@ -273,7 +411,7 @@ public class StartupService {
     }
 
     private void connectSocket() throws ConnectionException {
-        lastConnectTime = System.currentTimeMillis();
+        long lastConnectTime = System.currentTimeMillis();
 
         try {
             disconnect();
@@ -285,19 +423,24 @@ public class StartupService {
 
             reader = new BufferedReader(new InputStreamReader(client.getInputStream()));
             writer = new BufferedWriter(new OutputStreamWriter(client.getOutputStream()));
+            //Compare existing redis data and get new status from betfair
         } catch (IOException e) {
             throw new ConnectionException("Failed to connect", e);
         }
     }
 
     public void disconnect() {
-        if (client != null) {
-            try {
-                client.close();
-            } catch (IOException e) {
-                logger.warn("Unable to close socket", e);
-            }
-            client = null;
+        stopReaderThread();
+        try {
+            if (reader != null) reader.close();
+            if (writer != null) writer.close();
+            if (client != null) client.close();
+        } catch (IOException e) {
+            logger.warn("Unable to disconnect socket ", e);
+        } finally {
+           reader = null;
+           writer = null;
+           client = null;
         }
     }
 
@@ -327,7 +470,6 @@ public class StartupService {
 
     private void connectAndAuthenticateAndResubscribe() {
         try {
-
             // Connect and auth
             connectAndAuthenticate();
 
@@ -341,10 +483,12 @@ public class StartupService {
             marketSubscription(marketSubscription);
 
             // Reset counter
-            reconnectCounter = 0;
+            int reconnectCounter = 0;
         } catch (Exception e) {
-            logger.error("Reconnect failed {}, reconnectCounter: {}", e, reconnectCounter);
-            reconnectCounter++;
+//            logger.error("Reconnect failed {}, reconnectCounter: {}", e, reconnectCounter);
+//            reconnectCounter++;
+            logger.error("Reconnect + resubscribe failed", e);
+            disconnected();
         }
     }
 
@@ -355,7 +499,7 @@ public class StartupService {
         if (sportDataMap.isEmpty()) {
             return Collections.emptyList();
         }
-        logger.info("sportdataMap: {}", sportDataMap);
+        //logger.info("sportdataMap: {}", sportDataMap);
 
         return sportDataMap.values().stream()
                 .filter(Objects::nonNull)
@@ -370,7 +514,12 @@ public class StartupService {
             throws ConnectionException, StatusException {
         AuthenticationMessage authenticationMessage = new AuthenticationMessage();
         authenticationMessage.setAppKey(appKey);
-        authenticationMessage.setSession(AuthService.getSessionToken());
+        // Fetch sessionToken using the injected AuthService
+        String sessionToken = authService.getSessionToken();
+        if (sessionToken == null || sessionToken.isEmpty()) {
+            throw new ConnectionException("Session token is missing or invalid.");
+        }
+        authenticationMessage.setSession(sessionToken);
         waitFor(processor.authenticate(authenticationMessage));
     }
 
@@ -379,14 +528,22 @@ public class StartupService {
         return size > 0;
     }
 
+    private boolean isConnected() {
+        return writer != null && client != null && !client.isClosed();
+    }
+
     private void sendLineImpl(String line) throws ConnectionException {
         try {
+            if (!isConnected()) {
+                logger.error("Not connected. Cannot send line: {}", line);
+                throw new ConnectionException("Not connected to socket");
+            }
             writer.write(line);
             writer.write(CRLF);
             writer.flush();
         } catch (IOException e) {
             logger.error("Error sending to socket - disconnecting", e);
-            disconnect();
+            disconnected();
             throw new ConnectionException("Error sending to socket", e);
         }
     }

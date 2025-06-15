@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.Getter;
+import lombok.RequiredArgsConstructor;
 import org.apache.http.NameValuePair;
 import org.apache.http.client.entity.UrlEncodedFormEntity;
 import org.apache.http.client.methods.CloseableHttpResponse;
@@ -20,6 +21,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.http.*;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -37,6 +39,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 @Service
+@RequiredArgsConstructor
 public class AuthService {
     Logger logger = LoggerFactory.getLogger(AuthService.class);
 
@@ -68,16 +71,18 @@ public class AuthService {
     private String keepAliveUrl;
 
     @Getter
-    private static String sessionToken;
+    private String sessionToken;
 
     private CloseableHttpClient httpClient;
 
     private final RestTemplate restTemplate;
+    private final RedisTemplate<String, Object> redisTemplate;
 
-    @Autowired
-    public AuthService(RestTemplate restTemplate) {
-        this.restTemplate = restTemplate;
-    }
+//    @Autowired
+//    public AuthService(RestTemplate restTemplate) {
+//        this.restTemplate = restTemplate;
+//       // this.redisTemplate = redisTemplate;
+//    }
 
     @PostConstruct
     public void init() {
@@ -145,6 +150,7 @@ public class AuthService {
 
             String responseString = response.getBody();
             logger.info("Logout response: {}", responseString);
+            redisTemplate.delete("betfairToken");
         } catch (Exception e) {
             logger.error("Error calling logout API", e);
         }
@@ -167,8 +173,9 @@ public class AuthService {
         }
     }
 
-    private static void setSessionToken(String token) {
+    private void setSessionToken(String token) {
         sessionToken = token;
+        redisTemplate.opsForValue().set("betfairToken", token);
     }
 
     private BetfairLoginResponse parseResponse(String responseString) throws IOException {

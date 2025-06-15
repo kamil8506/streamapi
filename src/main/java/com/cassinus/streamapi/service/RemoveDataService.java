@@ -127,7 +127,7 @@ public class RemoveDataService {
     private void processMatchRemoval(MatchData matchData, String matchId, String matchKey) {
         if (matchData != null) {
             log.info("Match {} removed by {}", matchId, matchKey);
-            matchDataRepository.deleteByMatchId(Long.valueOf(matchId));
+            //matchDataRepository.deleteByMatchId(Long.valueOf(matchId));
             redisTemplate.opsForHash().delete(RedisNameSpace.MATCH_DATA.getName(), matchKey);
             publishService.publishDataToGame(matchData, RedisNameSpace.MATCH_UPDATE.getName(), OperationType.REMOVE);
             marketCountService.removeMarketCountField("MATCH", String.valueOf(matchData.getSportId()) + matchData.getEventId() + matchId);
@@ -137,7 +137,7 @@ public class RemoveDataService {
     private void processEventRemoval(EventData eventData, String eventId, String eventKey) {
         if (eventData != null) {
             log.info("event removed: {}", eventData.getEventId());
-            eventDataRepository.deleteByEventId(Long.valueOf(eventId));
+            //eventDataRepository.deleteByEventId(Long.valueOf(eventId));
             redisTemplate.opsForHash().delete(RedisNameSpace.EVENT_DATA.getName(), eventKey);
             publishService.publishDataToGame(eventData, RedisNameSpace.EVENT_UPDATE.getName(), OperationType.REMOVE);
             marketCountService.removeMarketCountField("EVENT", eventData.getSportId() + eventId);

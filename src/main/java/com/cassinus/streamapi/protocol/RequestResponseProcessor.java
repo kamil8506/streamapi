@@ -16,6 +16,7 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -26,6 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 @Getter
+@Slf4j
 public class RequestResponseProcessor {
     public static final String REQUEST_AUTHENTICATION = "authentication";
     public static final String REQUEST_MARKET_SUBSCRIPTION = "marketSubscription";
@@ -36,7 +38,7 @@ public class RequestResponseProcessor {
     public static final String RESPONSE_MARKET_CHANGE_MESSAGE = "mcm";
     public static final String RESPONSE_ORDER_CHANGE_MESSAGE = "ocm";
 
-    private static final Logger LOG = LoggerFactory.getLogger(RequestResponseProcessor.class);
+    //private static final Logger LOG = LoggerFactory.getLogger(RequestResponseProcessor.class);
     private final ObjectMapper objectMapper;
     private final AtomicInteger nextId = new AtomicInteger();
     private FutureResponse<ConnectionMessage> connectionMessage = new FutureResponse<>();
@@ -79,7 +81,7 @@ public class RequestResponseProcessor {
             return;
         }
         ConnectionStatusChangeEvent args = new ConnectionStatusChangeEvent(this, status, value);
-        LOG.info("ESAClient: Status changed {} -> {}", status, value);
+        log.info("ESAClient: Status changed {} -> {}", status, value);
         status = value;
 
         dispatchConnectionStatusChange(args);
@@ -89,7 +91,7 @@ public class RequestResponseProcessor {
         try {
             connectionStatusListeners.forEach(c -> c.connectionStatusChange(args));
         } catch (Exception e) {
-            LOG.error("Exception during event dispatch", e);
+            log.error("Exception during event dispatch", e);
 
         }
     }
@@ -179,7 +181,7 @@ public class RequestResponseProcessor {
                 // should never happen
                 throw new ConnectionException("Failed to marshall json", e);
             }
-            LOG.info("Client->ESA: {}", line);
+           log.info("Client->ESA: {}", line);
 
             // send line
             sendLine.sendLine(line);
@@ -203,11 +205,11 @@ public class RequestResponseProcessor {
         lastResponseTime = System.currentTimeMillis();
         switch (message.getOp()) {
             case RESPONSE_CONNECTION -> {
-                LOG.info("ESA->Client: {}", line);
+               log.info("ESA->Client: {}", line);
                 processConnectionMessage((ConnectionMessage) message);
             }
             case RESPONSE_STATUS -> {
-                LOG.info("ESA->Client: {}", line);
+                log.info("ESA->Client: {}", line);
                 processStatusMessage((StatusMessage) message);
             }
             case RESPONSE_MARKET_CHANGE_MESSAGE -> {
@@ -218,14 +220,14 @@ public class RequestResponseProcessor {
                 traceChange(line);
                 processOrderChangeMessage((OrderChangeMessage) message);
             }
-            default -> LOG.error(
+            default -> log.error(
                     "ESA->Client: Unknown message type: {}, message:{}", message.getOp(), line);
         }
     }
 
     private void traceChange(String line) {
         if (traceChangeTruncation != 0) {
-            LOG.info(
+            log.info(
                     "ESA->Client: {}",
                     line.substring(0, Math.min(traceChangeTruncation, line.length())));
         }
@@ -261,7 +263,7 @@ public class RequestResponseProcessor {
     }
 
     private void processUncorrelatedStatus(StatusMessage statusMessage) {
-        LOG.error("Error Status Notification: {}", statusMessage);
+        log.error("Error Status Notification: {}", statusMessage);
         changeHandler.onErrorStatusNotification(statusMessage);
     }
 
@@ -285,7 +287,7 @@ public class RequestResponseProcessor {
 
         @Override
         public void onErrorStatusNotification(StatusMessage message) {
-            LOG.info("onErrorStatusNotification: {}", message);
+            log.info("onErrorStatusNotification: {}", message);
         }
     }
 }

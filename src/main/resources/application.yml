@@ -5,18 +5,21 @@ spring:
     mongodb:
       uri: mongodb://localhost:27017/exchange_betfair_mongo_feed_db_dev
       database: exchange_betfair_mongo_feed_db_dev
-  redis:
-    host: localhost
-    port: 6379
+    redis:
+      host: localhost
+      port: 6379
+
+  kafka:
+    bootstrap-servers: 18.170.217.77:9092
 
 betfair:
   type: pkcs12
-  app-key: SdfdfRjtyk66
-  username: JetF2wretfh
-  password: G@eghet1234
+  app-key: ONGM7Wou3FS0Bofs
+  username: Satfair12
+  password: Dubai@20256
   cert-path: C:\Users\User\Documents\Sijo-latest-code\stream-api\src\main\resources\certificate\betFair.p12
   #cert-path: /app/betFair.p12
-  cert-password: betdsaQ23
+  cert-password: betfairapp
   login-url: https://identitysso-cert.betfair.com/api/certlogin
   logout-url: https://identitysso.betfair.com/api/logout
   keepAlive-url: https://identitysso.betfair.com/api/keepAlive
@@ -24,14 +27,15 @@ betfair:
 
 stream:
   host: stream-api.betfair.com
-  timeout: 30000
+  timeout: 600000
   port: 443
-  keepAlive: 3600000
+  keepAlive: 60000
   isMarketRemovedOnClose: true
   autoReconnect: true
-  reconnectBackOff: 15000
-  conflateMs: 60000
+  reconnectBackOff: 500
+  conflateMs: 500
   heartbeatMs: 1000
+  isRecoveryMode: true
 
 logging:
   file:
@@ -42,3 +46,10 @@ logging:
 scheduled:
   initialDelay: 1800000  # 30 minutes in milliseconds
   fixedRate: 900000      # 15 minutes in milliseconds
+
+api:
+  rest-url: https://api.betfair.com/exchange/betting/rest/v1.0/
+  app-key: ONGM7Wou3FS0Bofs
+
+market:
+  max-count: 1000
