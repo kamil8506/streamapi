@@ -12,6 +12,7 @@ import com.cassinus.common.repository.*;
 import com.cassinus.common.service.MarketCountService;
 import com.cassinus.common.service.SequenceGeneratorService;
 //import com.cassinus.streamapi.model.MarketBook;
+import com.cassinus.streamapi.event.OddsReconnectEvent;
 import com.cassinus.streamapi.model.SportsMatchDetails;
 import com.cassinus.streamapi.protocol.ChangeMessage;
 import com.cassinus.streamapi.service.MarketProducer;
@@ -25,11 +26,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.mongodb.repository.MongoRepository;
 import org.springframework.data.redis.core.Cursor;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
@@ -68,6 +71,9 @@ public class MarketCache {
     // Local in-memory cache for storing checked market IDs
     private final Set<String> checkedMarkets;
 
+    private volatile long lastOddsReceived = System.currentTimeMillis();
+    private volatile boolean everReceivedOdds = false;
+
     @Autowired
     private MarketProducer producer;
     
@@ -101,6 +107,8 @@ public class MarketCache {
         }
 
         if (changeMessage.getItems() != null) {
+            lastOddsReceived = System.currentTimeMillis();
+            everReceivedOdds = true;
             // Lazy build events
             List<MarketChangeEvent> batch =
                     (batchMarketChangeListeners.isEmpty())
@@ -750,6 +758,28 @@ public class MarketCache {
         );
 
         return result != null ? result.intValue() : 0;
+    }
+
+    @Scheduled(fixedDelay = 3600000) // Runs every hour, adjust as needed
+    public void reapOrphanedMarkets() {
+        for (String marketId : new HashSet<>(checkedMarkets)) {
+            if (!isDataAvailable(RedisNameSpace.MARKET_DATA.getName(), marketId)) {
+                checkedMarkets.remove(marketId);
+                logger.info("Reaped orphaned marketId: {}", marketId);
+            }
+        }
+    }
+
+    @Autowired
+    private ApplicationEventPublisher publisher;
+    @Scheduled(fixedDelay = 60000)
+    public void oddsWatchdog() {
+        long now = System.currentTimeMillis();
+        if (everReceivedOdds && (now - lastOddsReceived > 120_000)) {
+            logger.warn("No odds have been received for the past 2 minutes, reconnecting via event...");
+            publisher.publishEvent(new OddsReconnectEvent(this));
+            everReceivedOdds = false;
+        }
     }
 
 

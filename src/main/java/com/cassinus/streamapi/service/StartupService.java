@@ -13,6 +13,7 @@ import com.cassinus.common.model.market.MarketDataFilter;
 import com.cassinus.common.model.market.MarketFilter;
 import com.cassinus.common.model.message.StatusMessage;
 import com.cassinus.common.repository.SubscriptionRepository;
+import com.cassinus.streamapi.event.OddsReconnectEvent;
 import com.cassinus.streamapi.model.*;
 import com.cassinus.streamapi.protocol.FutureResponse;
 import com.cassinus.streamapi.protocol.RequestResponseProcessor;
@@ -546,5 +547,11 @@ public class StartupService {
             disconnected();
             throw new ConnectionException("Error sending to socket", e);
         }
+    }
+
+    @EventListener
+    public void handleOddsReconnect(OddsReconnectEvent event) {
+        logger.info("Received OddsReconnectEvent, now reconnecting...");
+        disconnected();
     }
 }
